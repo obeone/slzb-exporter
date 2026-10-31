@@ -17,6 +17,10 @@ services:
       # SLZB-06 device configuration
       - SLZB_EXPORTER_SLZB_API_URL=http://your-slzb-device.local
       - SLZB_EXPORTER_METRICS_DEFAULT_INTERVAL=10s
+      # Optional HTTP Basic auth for a password protected device web UI
+      # (both must be set)
+      # - SLZB_EXPORTER_SLZB_USERNAME=admin
+      # - SLZB_EXPORTER_SLZB_PASSWORD=change-me
     restart: unless-stopped
     networks:
       - monitoring

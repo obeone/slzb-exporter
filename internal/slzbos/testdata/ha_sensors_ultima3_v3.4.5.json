@@ -1,0 +1,41 @@
+{
+    "Sensors": {
+        "esp32_temp": "45.80",
+        "zb_temp": "42.15",
+        "zb_temp2": "42.29",
+        "uptime": 32606,
+        "socket_uptime": 0,
+        "socket2_uptime": 2972,
+        "socket3_uptime": 2972,
+        "psram_usage": 374,
+        "psram_largest_free_block": 1471,
+        "lte_state": 0,
+        "lte_detect": false,
+        "ambilight": {
+            "ultLedMode": 0,
+            "ultLedColor": "#00ff00",
+            "ultLedBri": 64,
+            "ultLedSpeed": 50,
+            "ultLedColor2": "#0000ff",
+            "ultLedDir": 0
+        },
+        "ble": {
+            "state": 2,
+            "proxy_connected": false
+        },
+        "otbr_uptime": 32595,
+        "ram_usage": 233,
+        "ram_largest_free_block": 30,
+        "fs_used": 372,
+        "ethernet": true,
+        "wifi_connected": false,
+        "wifi_status": 254,
+        "vpn_status": false,
+        "disable_leds": false,
+        "night_mode": false,
+        "auto_zigbee": false,
+        "vpn_enabled": false,
+        "vpn_type": "none",
+        "otbr_status": 2
+    }
+}
