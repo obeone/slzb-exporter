@@ -47,6 +47,9 @@ type SLZBRegistry struct {
 	SLZBAPIResponseTimeSeconds    *prometheus.HistogramVec
 	SLZBAPITimeoutErrorsTotal     *prometheus.CounterVec
 	SLZBCollectionDurationSeconds *prometheus.HistogramVec
+
+	// OS holds the metrics fed by the SLZB-OS /ha_info and /ha_sensors endpoints
+	OS *SLZBOSMetrics
 }
 
 // NewSLZBRegistry creates a new SLZB metrics registry
@@ -324,6 +327,8 @@ func NewSLZBRegistry(baseRegistry *promexporter_metrics.Registry) *SLZBRegistry 
 	)
 
 	baseRegistry.AddMetricInfo("slzb_collection_duration_seconds", "Histogram of collection duration in seconds", []string{"device"})
+
+	slzb.OS = NewSLZBOSMetrics(factory, baseRegistry)
 
 	return slzb
 }
