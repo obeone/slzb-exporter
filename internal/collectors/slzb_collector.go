@@ -15,8 +15,8 @@ import (
 	"github.com/d0ugal/promexporter/tracing"
 	"github.com/d0ugal/slzb-exporter/internal/config"
 	"github.com/d0ugal/slzb-exporter/internal/metrics"
+	"github.com/d0ugal/slzb-exporter/internal/slzbos"
 	"github.com/prometheus/client_golang/prometheus"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -27,25 +27,48 @@ type SLZBCollector struct {
 	app     *app.App
 	client  *http.Client
 
+	// osClient reads the SLZB-OS /ha_* endpoints through client, so it shares
+	// its timeout, tracing and Basic auth.
+	osClient *slzbos.Client
+	// osInfo is the /ha_info payload parsed during the current cycle, nil when
+	// it was not fetched or did not parse; the firmware step reads it.
+	osInfo *slzbos.Info
+
 	deviceInfo map[string]string // Cache for device information
 	deviceID   string            // Derived device identifier
+
+	// firmwareVersion is the version label last set on
+	// slzb_firmware_current_version, used to drop the previous series only
+	// when the version actually changes.
+	firmwareVersion string
+
+	// interRequestDelay is the pause at the end of each cycle, sparing the
+	// low-power device back-to-back requests. Tests set it to 0.
+	interRequestDelay time.Duration
 }
+
+// defaultInterRequestDelay is the historical pause at the end of a cycle.
+const defaultInterRequestDelay = 500 * time.Millisecond
 
 // NewSLZBCollector creates a new SLZB collector
 func NewSLZBCollector(cfg *config.Config, metricsRegistry *metrics.SLZBRegistry, app *app.App) *SLZBCollector {
 	// Derive device ID from API URL
 	deviceID := deriveDeviceID(cfg.SLZB.APIURL)
 
+	client := &http.Client{
+		Timeout:   15 * time.Second, // Longer timeout for low-power device
+		Transport: newDeviceTransport(cfg.SLZB),
+	}
+
 	return &SLZBCollector{
-		config:  cfg,
-		metrics: metricsRegistry,
-		app:     app,
-		client: &http.Client{
-			Timeout:   15 * time.Second, // Longer timeout for low-power device
-			Transport: otelhttp.NewTransport(http.DefaultTransport),
-		},
-		deviceInfo: make(map[string]string),
-		deviceID:   deviceID,
+		config:            cfg,
+		metrics:           metricsRegistry,
+		app:               app,
+		client:            client,
+		osClient:          slzbos.NewClient(client, cfg.SLZB.APIURL),
+		deviceInfo:        make(map[string]string),
+		deviceID:          deviceID,
+		interRequestDelay: defaultInterRequestDelay,
 	}
 }
 
@@ -161,12 +184,64 @@ func (sc *SLZBCollector) collectMetrics(ctx context.Context) {
 			"duration", duration)
 	}()
 
-	// Get device information and test reachability in one request
+	// Get device information from the legacy endpoint, then from the SLZB-OS
+	// endpoints. There is no early return in between: SLZB-OS v3 devices may
+	// not serve the legacy data at all.
 	deviceInfoStart := time.Now()
-	deviceReachable := sc.collectDeviceInfo(ctx, deviceID)
+	legacy := sc.collectDeviceInfo(ctx, deviceID)
+	osResult := sc.collectSLZBOSMetrics(ctx, deviceID, legacy)
 	deviceInfoDuration := time.Since(deviceInfoStart).Seconds()
 
-	if deviceReachable {
+	// Legacy error accounting is decided only now, since an absent legacy
+	// endpoint is expected (quiet) on a device that serves /ha_*.
+	sc.reportLegacyErrors(deviceID, legacy, osResult)
+
+	deviceReachable := legacy.reachable(osResult.supported, osResult.infoOK)
+	sc.recordReachability(collectorSpan, deviceID, deviceReachable, deviceInfoDuration)
+
+	if !deviceReachable {
+		return
+	}
+
+	successfulCollections++
+	totalCollections++
+
+	if sc.runFirmwareStep(ctx, collectorSpan, deviceID, legacy.status == legacyOK) {
+		successfulCollections++
+	}
+
+	totalCollections++
+
+	if legacy.runsConfigStep(osResult.supported, deviceReachable) {
+		if sc.runConfigurationStep(ctx, collectorSpan, deviceID) {
+			successfulCollections++
+		}
+
+		totalCollections++
+	}
+
+	// Add a small delay between requests
+	if sc.interRequestDelay > 0 {
+		time.Sleep(sc.interRequestDelay)
+	}
+}
+
+// reportLegacyErrors counts and logs the legacy step's HTTP error once the
+// /ha_* outcome is known, and emits the single per-cycle 401 warning.
+func (sc *SLZBCollector) reportLegacyErrors(deviceID string, legacy legacyResult, osResult slzbOSResult) {
+	if legacy.countsHTTPError(osResult.supported) {
+		sc.handleDeviceInfoHTTPError(deviceID, legacy.httpStatus)
+	}
+
+	if legacy.authFailed() || osResult.authFailed {
+		sc.logAuthFailure(deviceID)
+	}
+}
+
+// recordReachability sets slzb_device_reachable and slzb_device_connected,
+// counts device_unreachable and annotates the cycle span.
+func (sc *SLZBCollector) recordReachability(collectorSpan *tracing.CollectorSpan, deviceID string, reachable bool, deviceInfoDuration float64) {
+	if reachable {
 		sc.metrics.SLZBDeviceReachable.With(prometheus.Labels{
 			"device": deviceID,
 		}).Set(1)
@@ -184,97 +259,92 @@ func (sc *SLZBCollector) collectMetrics(ctx context.Context) {
 			)
 		}
 
-		successfulCollections++
-	} else {
-		sc.metrics.SLZBDeviceReachable.With(prometheus.Labels{
-			"device": deviceID,
-		}).Set(0)
-		sc.metrics.SLZBConnected.With(prometheus.Labels{
-			"device": deviceID,
-		}).Set(0)
-		sc.metrics.SLZBCollectionErrors.With(prometheus.Labels{
-			"device":     deviceID,
-			"error_type": "device_unreachable",
-		}).Inc()
-
-		if collectorSpan != nil {
-			collectorSpan.SetAttributes(
-				attribute.Float64("device_info.duration_seconds", deviceInfoDuration),
-				attribute.Bool("device.reachable", false),
-			)
-			collectorSpan.RecordError(fmt.Errorf("device unreachable"), attribute.String("device.id", deviceID))
-			collectorSpan.AddEvent("device_unreachable",
-				attribute.Float64("duration_seconds", deviceInfoDuration),
-			)
-		}
-
-		slog.Error("Device unreachable", "device", deviceID)
-
 		return
 	}
 
-	totalCollections++
+	sc.metrics.SLZBDeviceReachable.With(prometheus.Labels{
+		"device": deviceID,
+	}).Set(0)
+	sc.metrics.SLZBConnected.With(prometheus.Labels{
+		"device": deviceID,
+	}).Set(0)
+	sc.metrics.SLZBCollectionErrors.With(prometheus.Labels{
+		"device":     deviceID,
+		"error_type": "device_unreachable",
+	}).Inc()
 
-	// NEW: Collect firmware update status
-	firmwareStart := time.Now()
-	if sc.collectFirmwareStatus(ctx, deviceID) {
-		firmwareDuration := time.Since(firmwareStart).Seconds()
-		if collectorSpan != nil {
-			collectorSpan.SetAttributes(
-				attribute.Float64("firmware.duration_seconds", firmwareDuration),
-			)
-			collectorSpan.AddEvent("firmware_status_collected",
-				attribute.Float64("duration_seconds", firmwareDuration),
-			)
-		}
-
-		successfulCollections++
-	} else {
-		firmwareDuration := time.Since(firmwareStart).Seconds()
-		if collectorSpan != nil {
-			collectorSpan.SetAttributes(
-				attribute.Float64("firmware.duration_seconds", firmwareDuration),
-			)
-			collectorSpan.RecordError(fmt.Errorf("firmware status collection failed"), attribute.String("device.id", deviceID))
-		}
+	if collectorSpan != nil {
+		collectorSpan.SetAttributes(
+			attribute.Float64("device_info.duration_seconds", deviceInfoDuration),
+			attribute.Bool("device.reachable", false),
+		)
+		collectorSpan.RecordError(fmt.Errorf("device unreachable"), attribute.String("device.id", deviceID))
+		collectorSpan.AddEvent("device_unreachable",
+			attribute.Float64("duration_seconds", deviceInfoDuration),
+		)
 	}
 
-	totalCollections++
-
-	// NEW: Collect configuration management metrics
-	configStart := time.Now()
-	if sc.collectConfigurationMetrics(ctx, deviceID) {
-		configDuration := time.Since(configStart).Seconds()
-		if collectorSpan != nil {
-			collectorSpan.SetAttributes(
-				attribute.Float64("configuration.duration_seconds", configDuration),
-			)
-			collectorSpan.AddEvent("configuration_metrics_collected",
-				attribute.Float64("duration_seconds", configDuration),
-			)
-		}
-
-		successfulCollections++
-	} else {
-		configDuration := time.Since(configStart).Seconds()
-		if collectorSpan != nil {
-			collectorSpan.SetAttributes(
-				attribute.Float64("configuration.duration_seconds", configDuration),
-			)
-			collectorSpan.RecordError(fmt.Errorf("configuration metrics collection failed"), attribute.String("device.id", deviceID))
-		}
-	}
-
-	totalCollections++
-
-	// Add a small delay between requests
-	time.Sleep(500 * time.Millisecond)
+	slog.Error("Device unreachable", "device", deviceID)
 }
 
-// collectDeviceInfo collects device information and caches it
+// runFirmwareStep runs collectFirmwareStatus and annotates the cycle span. It
+// returns whether the step succeeded.
+func (sc *SLZBCollector) runFirmwareStep(ctx context.Context, collectorSpan *tracing.CollectorSpan, deviceID string, legacyOK bool) bool {
+	firmwareStart := time.Now()
+	ok := sc.collectFirmwareStatus(ctx, deviceID, legacyOK)
+	firmwareDuration := time.Since(firmwareStart).Seconds()
+
+	if collectorSpan == nil {
+		return ok
+	}
+
+	collectorSpan.SetAttributes(
+		attribute.Float64("firmware.duration_seconds", firmwareDuration),
+	)
+
+	if ok {
+		collectorSpan.AddEvent("firmware_status_collected",
+			attribute.Float64("duration_seconds", firmwareDuration),
+		)
+	} else {
+		collectorSpan.RecordError(fmt.Errorf("firmware status collection failed"), attribute.String("device.id", deviceID))
+	}
+
+	return ok
+}
+
+// runConfigurationStep runs collectConfigurationMetrics and annotates the
+// cycle span. It returns whether the step succeeded.
+func (sc *SLZBCollector) runConfigurationStep(ctx context.Context, collectorSpan *tracing.CollectorSpan, deviceID string) bool {
+	configStart := time.Now()
+	ok := sc.collectConfigurationMetrics(ctx, deviceID)
+	configDuration := time.Since(configStart).Seconds()
+
+	if collectorSpan == nil {
+		return ok
+	}
+
+	collectorSpan.SetAttributes(
+		attribute.Float64("configuration.duration_seconds", configDuration),
+	)
+
+	if ok {
+		collectorSpan.AddEvent("configuration_metrics_collected",
+			attribute.Float64("duration_seconds", configDuration),
+		)
+	} else {
+		collectorSpan.RecordError(fmt.Errorf("configuration metrics collection failed"), attribute.String("device.id", deviceID))
+	}
+
+	return ok
+}
+
+// collectDeviceInfo collects device information from the legacy endpoint and
+// caches it. It returns the tri-state legacy outcome; HTTP status errors are
+// not counted here but by collectMetrics, once the /ha_* outcome is known.
 //
 //nolint:contextcheck // Context is updated to include span for child operations
-func (sc *SLZBCollector) collectDeviceInfo(ctx context.Context, deviceName string) bool {
+func (sc *SLZBCollector) collectDeviceInfo(ctx context.Context, deviceName string) legacyResult {
 	tracer := sc.app.GetTracer()
 
 	var (
@@ -309,7 +379,7 @@ func (sc *SLZBCollector) collectDeviceInfo(ctx context.Context, deviceName strin
 
 		sc.handleDeviceInfoRequestError(deviceName, err)
 
-		return false
+		return legacyResult{status: legacyFailed}
 	}
 
 	defer func() {
@@ -322,16 +392,20 @@ func (sc *SLZBCollector) collectDeviceInfo(ctx context.Context, deviceName strin
 	responseTime := time.Since(startTime).Seconds()
 	sc.updateDeviceInfoMetrics(deviceName, resp, responseTime)
 
+	respValuesArr := resp.Header.Get("respValuesArr")
+	result := legacyResult{
+		status:     classifyLegacyResponse(resp.StatusCode, respValuesArr != "", peekErrorBody(resp)),
+		httpStatus: resp.StatusCode,
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		sc.handleDeviceInfoHTTPError(deviceName, resp.StatusCode)
-		return false
+		return result
 	}
 
 	// Parse and process device data
-	respValuesArr := resp.Header.Get("respValuesArr")
 	if respValuesArr != "" {
 		processStart := time.Now()
-		result := sc.processDeviceData(ctx, deviceName, respValuesArr)
+		processed := sc.processDeviceData(ctx, deviceName, respValuesArr)
 		processDuration := time.Since(processStart).Seconds()
 		totalDuration := time.Since(startTime).Seconds()
 
@@ -340,10 +414,10 @@ func (sc *SLZBCollector) collectDeviceInfo(ctx context.Context, deviceName strin
 				attribute.Float64("api_request.duration_seconds", apiDuration),
 				attribute.Float64("process_data.duration_seconds", processDuration),
 				attribute.Float64("total.duration_seconds", totalDuration),
-				attribute.Bool("processing.success", result),
+				attribute.Bool("processing.success", processed),
 			)
 
-			if result {
+			if processed {
 				collectorSpan.AddEvent("device_data_processed",
 					attribute.Float64("total_duration_seconds", totalDuration),
 				)
@@ -352,6 +426,10 @@ func (sc *SLZBCollector) collectDeviceInfo(ctx context.Context, deviceName strin
 					attribute.Float64("total_duration_seconds", totalDuration),
 				)
 			}
+		}
+
+		if !processed {
+			result.status = legacyFailed
 		}
 
 		return result
@@ -372,7 +450,23 @@ func (sc *SLZBCollector) collectDeviceInfo(ctx context.Context, deviceName strin
 		)
 	}
 
-	return true
+	return result
+}
+
+// peekErrorBody returns the start of a non-200 response body, where SMLIGHT
+// firmware may put its "URL NOT FOUND" marker. A 200 body is never read: the
+// legacy data travels in a header and the body may be a large web page.
+func peekErrorBody(resp *http.Response) []byte {
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, legacyBodyPeekBytes))
+	if err != nil {
+		slog.Debug("Failed to read legacy error body", "error", err)
+	}
+
+	return body
 }
 
 // handleDeviceInfoRequestError handles request errors for device info collection
@@ -403,14 +497,24 @@ func (sc *SLZBCollector) updateDeviceInfoMetrics(deviceName string, resp *http.R
 	}).Inc()
 }
 
-// handleDeviceInfoHTTPError handles HTTP errors for device info collection
+// handleDeviceInfoHTTPError handles HTTP errors for device info collection.
+// A 401 is counted as auth_error and not logged here: collectMetrics emits a
+// single auth warning per cycle with a configuration hint.
 func (sc *SLZBCollector) handleDeviceInfoHTTPError(deviceName string, statusCode int) {
+	errorType := "http_error"
+	if statusCode == http.StatusUnauthorized {
+		errorType = "auth_error"
+	}
+
 	sc.metrics.SLZBHTTPErrorsTotal.With(prometheus.Labels{
 		"device":     deviceName,
 		"action":     "0",
-		"error_type": "http_error",
+		"error_type": errorType,
 	}).Inc()
-	slog.Error("HTTP error getting device info", "status", statusCode)
+
+	if statusCode != http.StatusUnauthorized {
+		slog.Error("HTTP error getting device info", "status", statusCode)
+	}
 }
 
 // processDeviceData processes the device data from the response header
@@ -719,8 +823,10 @@ func (sc *SLZBCollector) setDefaultDeviceInfo(deviceName string) {
 	slog.Debug("Device info collected with defaults", "device", deviceName, "info", sc.deviceInfo)
 }
 
-// NEW: collectFirmwareStatus collects firmware version and update status
-func (sc *SLZBCollector) collectFirmwareStatus(ctx context.Context, deviceName string) bool {
+// collectFirmwareStatus collects firmware version and update status.
+// legacyOK tells whether the legacy step parsed fresh data this cycle, which
+// selects the version source (see firmwareVersionSource).
+func (sc *SLZBCollector) collectFirmwareStatus(ctx context.Context, deviceName string, legacyOK bool) bool {
 	tracer := sc.app.GetTracer()
 
 	var collectorSpan *tracing.CollectorSpan
@@ -738,13 +844,9 @@ func (sc *SLZBCollector) collectFirmwareStatus(ctx context.Context, deviceName s
 
 	// Get firmware information from device info (already collected)
 	firmwareVersion := "unknown"
-	if deviceInfo, ok := sc.deviceInfo["VERSION"]; ok {
-		firmwareVersion = deviceInfo
-		sc.metrics.SLZBFirmwareCurrentVersion.With(prometheus.Labels{
-			"device":     deviceName,
-			"version":    deviceInfo,
-			"build_date": "unknown",
-		}).Set(1)
+	if version, ok := sc.firmwareVersionSource(legacyOK); ok {
+		firmwareVersion = version
+		sc.setFirmwareVersion(deviceName, version)
 	} else {
 		if collectorSpan != nil {
 			collectorSpan.AddEvent("firmware_version_not_found")
@@ -782,6 +884,36 @@ func (sc *SLZBCollector) collectFirmwareStatus(ctx context.Context, deviceName s
 	slog.Debug("Firmware status collected", "device", deviceName, "response_time", responseTime)
 
 	return true
+}
+
+// firmwareVersionSource picks the firmware version for this cycle: the legacy
+// VERSION when legacy data is fresh, else the /ha_info sw_version when it
+// parsed, else the cached legacy VERSION from an earlier cycle.
+func (sc *SLZBCollector) firmwareVersionSource(legacyOK bool) (string, bool) {
+	if !legacyOK && sc.osInfo != nil && sc.osInfo.SWVersion != "" {
+		return sc.osInfo.SWVersion, true
+	}
+
+	version, ok := sc.deviceInfo["VERSION"]
+
+	return version, ok
+}
+
+// setFirmwareVersion exports version on slzb_firmware_current_version. The
+// previous series of the device is deleted only when the version changed, so
+// an upgrade does not leave a stale series and a steady version is never
+// briefly missing from a scrape.
+func (sc *SLZBCollector) setFirmwareVersion(deviceName, version string) {
+	if version != sc.firmwareVersion {
+		sc.metrics.SLZBFirmwareCurrentVersion.DeletePartialMatch(prometheus.Labels{"device": deviceName})
+		sc.firmwareVersion = version
+	}
+
+	sc.metrics.SLZBFirmwareCurrentVersion.With(prometheus.Labels{
+		"device":     deviceName,
+		"version":    version,
+		"build_date": "unknown",
+	}).Set(1)
 }
 
 // NEW: collectConfigurationMetrics collects configuration file metrics

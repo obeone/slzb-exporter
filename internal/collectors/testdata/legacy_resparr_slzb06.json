@@ -1,0 +1,20 @@
+{
+  "hwRev": "SLZB-06",
+  "VERSION": "v2.7.2",
+  "espModel": "ESP32-D0WD-V3",
+  "deviceTemp": "45.50",
+  "espHeapFree": "120",
+  "espHeapSize": "240",
+  "operationalMode": "Zigbee-to-Ethernet",
+  "uptime": "7 d 16:47:19",
+  "connectedSocket": "0 d 01:02:03",
+  "connectedSocketStatus": "1",
+  "ethConnection": "Connected",
+  "ethDhcp": "On",
+  "ethIp": "192.0.2.20",
+  "etchMask": "255.255.255.0",
+  "ethGate": "192.0.2.1",
+  "ethSpd": "100 Mbps",
+  "ethMac": "00:11:22:33:44:66",
+  "wifiConnected": "0"
+}
