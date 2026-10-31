@@ -1,7 +1,9 @@
+// Package config loads the exporter configuration from environment variables.
 package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
@@ -16,13 +18,58 @@ type Config struct {
 	SLZB SLZBConfig `yaml:"slzb"`
 }
 
-// SLZBConfig represents the SLZB device configuration
+// SLZBConfig represents the SLZB device configuration.
+//
+// Username and Password are the HTTP Basic auth credentials of the device web
+// UI. They are optional: devices without a web password configured accept
+// unauthenticated requests.
 type SLZBConfig struct {
 	APIURL   string        `yaml:"api_url"`
 	Interval time.Duration `yaml:"interval"`
+	Username string        `yaml:"username"`
+	Password string        `yaml:"password"`
 }
 
-// LoadConfig loads configuration from environment variables with defaults
+// redactedPassword replaces a non-empty password wherever the config is
+// rendered, so the secret never reaches logs or traces.
+const redactedPassword = "[REDACTED]"
+
+// HasAuth reports whether both Basic auth credentials are set. A lone username
+// or password is treated as "no auth", since the device rejects half a pair.
+func (c SLZBConfig) HasAuth() bool {
+	return c.Username != "" && c.Password != ""
+}
+
+// maskedPassword returns the placeholder for a set password and an empty
+// string otherwise, so readers can still tell whether a password is configured.
+func (c SLZBConfig) maskedPassword() string {
+	if c.Password == "" {
+		return ""
+	}
+
+	return redactedPassword
+}
+
+// String renders the config with the password redacted. fmt calls it for %v
+// and %+v, including when SLZBConfig is nested in Config, which keeps an
+// accidental Printf of the whole config from leaking the secret.
+func (c SLZBConfig) String() string {
+	return fmt.Sprintf("{APIURL:%s Interval:%s Username:%s Password:%s}",
+		c.APIURL, c.Interval, c.Username, c.maskedPassword())
+}
+
+// LogValue implements slog.LogValuer so that logging the config through slog
+// redacts the password as well.
+func (c SLZBConfig) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("api_url", c.APIURL),
+		slog.Duration("interval", c.Interval),
+		slog.String("username", c.Username),
+		slog.String("password", c.maskedPassword()),
+	)
+}
+
+// LoadConfig loads configuration from environment variables with defaults.
 func LoadConfig() (*Config, error) {
 	cfg := &Config{}
 
@@ -88,5 +135,15 @@ func LoadConfig() (*Config, error) {
 		cfg.SLZB.Interval = 10 * time.Second
 	}
 
+	loadSLZBAuth(&cfg.SLZB)
+
 	return cfg, nil
+}
+
+// loadSLZBAuth reads the optional device Basic auth credentials from the
+// environment. Both values are taken verbatim (no trimming), since spaces may
+// be part of a password.
+func loadSLZBAuth(c *SLZBConfig) {
+	c.Username = os.Getenv("SLZB_EXPORTER_SLZB_USERNAME")
+	c.Password = os.Getenv("SLZB_EXPORTER_SLZB_PASSWORD")
 }
