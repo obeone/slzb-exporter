@@ -1,0 +1,16 @@
+# Keep the build context to what the Dockerfile needs: sources and go.mod/go.sum.
+.git
+.github
+.claude
+.omc
+.golangci-lint-cache
+
+# Local build artifacts
+main
+slzb-exporter
+coverage.*
+
+# Docs and examples are not needed to build the binary
+*.md
+config.example.yaml
+docker-compose.example.yml
