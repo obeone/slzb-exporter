@@ -1,16 +1,10 @@
-# Keep the build context to what the Dockerfile needs: sources and go.mod/go.sum.
-.git
-.github
-.claude
-.omc
-.golangci-lint-cache
-
-# Local build artifacts
+# Only untracked build artifacts and local tool state are listed here.
+# Excluding tracked files (or .git) would make the `git describe --dirty`
+# fallback in the Dockerfile stamp builds without a VERSION build arg as
+# dirty or dev, so .git and the sources stay in the context.
 main
 slzb-exporter
 coverage.*
-
-# Docs and examples are not needed to build the binary
-*.md
-config.example.yaml
-docker-compose.example.yml
+.golangci-lint-cache
+.claude
+.omc
